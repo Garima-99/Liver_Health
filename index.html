@@ -1330,8 +1330,8 @@ return el;
 }
 
 // ═══ GOOGLE HEALTH API (replaces Fitbit Web API) ═══
-const GHEALTH_BASE="https://health.googleapis.com/v4/users/me/dataSources/-/datasets";
-const GHEALTH_SCOPES="https://www.googleapis.com/auth/health.activity.read https://www.googleapis.com/auth/health.heart_rate.read https://www.googleapis.com/auth/health.sleep.read https://www.googleapis.com/auth/health.oxygen_saturation.read https://www.googleapis.com/auth/health.body_temperature.read";
+const GHEALTH_API="https://health.googleapis.com/v4/users/me/dataTypes";
+const GHEALTH_SCOPES="https://www.googleapis.com/auth/googlehealth.activity_and_fitness https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements https://www.googleapis.com/auth/googlehealth.sleep";
 
 function getGHealthToken(){return localStorage.getItem("liver_ghealth_token")}
 function getGHealthClientId(){return localStorage.getItem("liver_ghealth_cid")||""}
@@ -1365,14 +1365,8 @@ console.log("Google Health API connected");
 }
 checkGHealthCallback();
 
-// Date helpers for API
-function isoRange(daysBack){
-const end=new Date();
-const start=new Date();start.setDate(start.getDate()-daysBack);
-return{start:start.toISOString(),end:end.toISOString()};
-}
-
-async function ghFetch(endpoint){
+// Date helpers
+function ghFetch(endpoint){
 const token=getGHealthToken();
 if(!token)throw new Error("Not connected");
 const resp=await fetch(endpoint,{headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"}});
@@ -1382,58 +1376,59 @@ return resp.json();
 }
 
 async function syncHealthData(p){
-const results={};const r=isoRange(7);
-const timeParams="?aggregation.startTime="+r.start+"&aggregation.endTime="+r.end;
-const listParams="?startTime="+r.start+"&endTime="+r.end;
+const results={};
+const now=new Date();
+const weekAgo=new Date(now);weekAgo.setDate(weekAgo.getDate()-7);
+const startFilter=weekAgo.toISOString().split(".")[0]+"Z";
 
 try{
 const fetches=await Promise.allSettled([
-ghFetch(GHEALTH_BASE+"/steps:dailyRollUp"+timeParams),
-ghFetch(GHEALTH_BASE+"/restingHeartRate:dailyRollUp"+timeParams),
-ghFetch(GHEALTH_BASE+"/sleep:list"+listParams),
-ghFetch(GHEALTH_BASE+"/oxygenSaturation:list"+listParams),
-ghFetch(GHEALTH_BASE+"/heartRate:list"+listParams+"&pageSize=50")
+ghFetch(GHEALTH_API+"/steps/dataPoints?filter="+encodeURIComponent('steps.interval.start_time.physical_time >= "'+startFilter+'"')+"&pageSize=500"),
+ghFetch(GHEALTH_API+"/daily-resting-heart-rate/dataPoints?filter="+encodeURIComponent('daily_resting_heart_rate.sample_time.physical_time >= "'+startFilter+'"')+"&pageSize=50"),
+ghFetch(GHEALTH_API+"/sleep/dataPoints?filter="+encodeURIComponent('sleep.overall.start_time.physical_time >= "'+startFilter+'"')+"&pageSize=20"),
+ghFetch(GHEALTH_API+"/daily-oxygen-saturation/dataPoints?filter="+encodeURIComponent('daily_oxygen_saturation.sample_time.physical_time >= "'+startFilter+'"')+"&pageSize=20")
 ]);
 
-// Parse steps
-if(fetches[0].status==="fulfilled"&&fetches[0].value?.dailyRollUps){
-results.steps=fetches[0].value.dailyRollUps.map(d=>({
-date:d.date||d.startTime?.split("T")[0],
-value:d.steps?.totalSteps||d.value||0
-}));
+// Parse steps (aggregate by day)
+if(fetches[0].status==="fulfilled"&&fetches[0].value?.dataPoints){
+const byDay={};
+fetches[0].value.dataPoints.forEach(dp=>{
+const d=dp.steps?.interval?.civilStartTime?.date;
+if(d){
+const ds=d.year+"-"+String(d.month).padStart(2,"0")+"-"+String(d.day).padStart(2,"0");
+byDay[ds]=(byDay[ds]||0)+parseInt(dp.steps?.count||0);
+}
+});
+results.steps=Object.entries(byDay).map(([date,value])=>({date,value})).sort((a,b)=>a.date.localeCompare(b.date));
 }
 
 // Parse resting heart rate
-if(fetches[1].status==="fulfilled"&&fetches[1].value?.dailyRollUps){
-results.heart=fetches[1].value.dailyRollUps.map(d=>({
-date:d.date||d.startTime?.split("T")[0],
-value:d.restingHeartRate?.beatsPerMinute||d.value||0
-}));
+if(fetches[1].status==="fulfilled"&&fetches[1].value?.dataPoints){
+results.heart=fetches[1].value.dataPoints.map(dp=>{
+const t=dp.dailyRestingHeartRate?.sampleTime?.civilTime?.date;
+const date=t?(t.year+"-"+String(t.month).padStart(2,"0")+"-"+String(t.day).padStart(2,"0")):"";
+return{date,value:dp.dailyRestingHeartRate?.beatsPerMinute||0};
+}).filter(d=>d.date&&d.value).sort((a,b)=>a.date.localeCompare(b.date));
 }
 
 // Parse sleep
-if(fetches[2].status==="fulfilled"){
-const sleepData=fetches[2].value?.sessions||fetches[2].value?.sleep||[];
-results.sleep=sleepData.map(s=>({
-date:s.startTime?.split("T")[0]||s.date,
-durationMs:s.durationMs||s.duration||0,
-efficiency:s.efficiency||null
-}));
+if(fetches[2].status==="fulfilled"&&fetches[2].value?.dataPoints){
+results.sleep=fetches[2].value.dataPoints.map(dp=>{
+const s=dp.sleep;if(!s)return null;
+const startDate=s.overall?.startTime?.civilTime?.date;
+const date=startDate?(startDate.year+"-"+String(startDate.month).padStart(2,"0")+"-"+String(startDate.day).padStart(2,"0")):"";
+const minAsleep=parseInt(s.summary?.minutesAsleep||0);
+return{date,durationMs:minAsleep*60000,efficiency:s.summary?.minutesAsleep&&s.summary?.minutesInSleepPeriod?Math.round(parseInt(s.summary.minutesAsleep)/parseInt(s.summary.minutesInSleepPeriod)*100):null};
+}).filter(d=>d&&d.date).sort((a,b)=>a.date.localeCompare(b.date));
 }
 
 // Parse SpO2
-if(fetches[3].status==="fulfilled"){
-const spo2Data=fetches[3].value?.dataPoints||fetches[3].value?.oxygenSaturation||[];
-results.spo2=spo2Data.length?{avg:spo2Data.reduce((s,d)=>s+(d.oxygenSaturation?.percentage||d.value||0),0)/spo2Data.length}:null;
+if(fetches[3].status==="fulfilled"&&fetches[3].value?.dataPoints){
+const spo2Pts=fetches[3].value.dataPoints;
+if(spo2Pts.length){
+const avg=spo2Pts.reduce((s,d)=>s+(d.dailyOxygenSaturation?.averagePercentage||0),0)/spo2Pts.length;
+results.spo2={avg:Math.round(avg*10)/10};
 }
-
-// Parse intraday heart rate
-if(fetches[4].status==="fulfilled"){
-const hrData=fetches[4].value?.dataPoints||[];
-results.hrIntraday=hrData.slice(-20).map(d=>({
-time:d.sampleTime?.physicalTime||d.time,
-bpm:d.heartRate?.beatsPerMinute||d.beatsPerMinute||0
-}));
 }
 
 results.synced=new Date().toISOString();
@@ -1545,11 +1540,13 @@ const setup=h("div",{style:{background:"var(--card2)",borderRadius:"14px",paddin
 setup.appendChild(h("div",{className:"sl"},"Setup (one-time, 5 minutes)"));
 setup.appendChild(h("div",{style:{fontSize:"13px",color:"var(--text2)",lineHeight:"1.8",marginBottom:"14px"}},
 "1. Go to ",h("strong",null,"console.cloud.google.com"),h("br",null),
-"2. Create a project, enable ",h("strong",null,"Google Health API"),h("br",null),
-"3. Set up OAuth consent screen (External, add your email as test user)",h("br",null),
-"4. Create OAuth credentials (Web app type)",h("br",null),
-"5. Add ",h("strong",{style:{fontSize:"11px",color:"var(--accent)",wordBreak:"break-all"}},window.location.href.split("#")[0].split("?")[0])," as redirect URI",h("br",null),
-"6. Copy the ",h("strong",null,"Client ID")," and paste below"
+"2. Create a project, search and enable ",h("strong",null,"Google Health API"),h("br",null),
+"3. OAuth consent screen: External, add your email as test user",h("br",null),
+"4. Add scopes: search 'googlehealth', select ",h("strong",null,"activity_and_fitness"),", ",h("strong",null,"health_metrics"),", ",h("strong",null,"sleep"),h("br",null),
+"5. Create OAuth credentials (Web app type)",h("br",null),
+"6. JS origin: ",h("strong",{style:{fontSize:"11px",color:"var(--accent)"}},"https://garima-99.github.io"),h("br",null),
+"7. Redirect URI: ",h("strong",{style:{fontSize:"11px",color:"var(--accent)",wordBreak:"break-all"}},window.location.href.split("#")[0].split("?")[0]),h("br",null),
+"8. Copy the ",h("strong",null,"Client ID")," and paste below"
 ));
 let cid=clientId;
 setup.appendChild(fl("Google OAuth Client ID","text",cid,v=>{cid=v},{ph:"123456789-abc.apps.googleusercontent.com"}));
