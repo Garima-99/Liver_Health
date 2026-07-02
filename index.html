@@ -1329,64 +1329,117 @@ key="";sv();clm();
 return el;
 }
 
-// ═══ FITBIT INTEGRATION ═══
-const FITBIT_AUTH_URL="https://www.fitbit.com/oauth2/authorize";
-const FITBIT_API="https://api.fitbit.com/1/user/-";
-const FITBIT_SCOPES="activity heartrate sleep profile oxygen_saturation temperature";
+// ═══ GOOGLE HEALTH API (replaces Fitbit Web API) ═══
+const GHEALTH_BASE="https://health.googleapis.com/v4/users/me/dataSources/-/datasets";
+const GHEALTH_SCOPES="https://www.googleapis.com/auth/health.activity.read https://www.googleapis.com/auth/health.heart_rate.read https://www.googleapis.com/auth/health.sleep.read https://www.googleapis.com/auth/health.oxygen_saturation.read https://www.googleapis.com/auth/health.body_temperature.read";
 
-function getFitbitToken(){return localStorage.getItem("liver_fitbit_token")}
-function getFitbitClientId(){return localStorage.getItem("liver_fitbit_client_id")||""}
-function getFitbitLastSync(){return localStorage.getItem("liver_fitbit_sync")||""}
+function getGHealthToken(){return localStorage.getItem("liver_ghealth_token")}
+function getGHealthClientId(){return localStorage.getItem("liver_ghealth_cid")||""}
+function getGHealthLastSync(){return localStorage.getItem("liver_ghealth_sync")||""}
 
-function connectFitbit(){
-const clientId=getFitbitClientId();
-if(!clientId){alert("Please set your Fitbit Client ID first");return}
+function connectGHealth(){
+const clientId=getGHealthClientId();
+if(!clientId){alert("Please set your Google Cloud Client ID first");return}
 const redirect=window.location.href.split("#")[0].split("?")[0];
-const url=FITBIT_AUTH_URL+"?response_type=token&client_id="+clientId+"&redirect_uri="+encodeURIComponent(redirect)+"&scope="+encodeURIComponent(FITBIT_SCOPES)+"&expires_in=31536000";
+const url="https://accounts.google.com/o/oauth2/v2/auth"
++"?client_id="+encodeURIComponent(clientId)
++"&redirect_uri="+encodeURIComponent(redirect)
++"&response_type=token"
++"&scope="+encodeURIComponent(GHEALTH_SCOPES)
++"&include_granted_scopes=true"
++"&prompt=consent";
 window.location.href=url;
 }
 
-// Check URL for Fitbit OAuth callback token
-function checkFitbitCallback(){
+// Check URL for Google OAuth callback token
+function checkGHealthCallback(){
 if(window.location.hash.includes("access_token")){
 const params=new URLSearchParams(window.location.hash.substring(1));
 const token=params.get("access_token");
 if(token){
-localStorage.setItem("liver_fitbit_token",token);
-window.location.hash="";
-console.log("Fitbit connected successfully");
+localStorage.setItem("liver_ghealth_token",token);
+history.replaceState(null,"",window.location.pathname);
+console.log("Google Health API connected");
 }
 }
 }
-checkFitbitCallback();
+checkGHealthCallback();
 
-async function fitbitFetch(endpoint){
-const token=getFitbitToken();
+// Date helpers for API
+function isoRange(daysBack){
+const end=new Date();
+const start=new Date();start.setDate(start.getDate()-daysBack);
+return{start:start.toISOString(),end:end.toISOString()};
+}
+
+async function ghFetch(endpoint){
+const token=getGHealthToken();
 if(!token)throw new Error("Not connected");
-const resp=await fetch(FITBIT_API+endpoint,{headers:{Authorization:"Bearer "+token}});
-if(resp.status===401){localStorage.removeItem("liver_fitbit_token");throw new Error("Token expired. Please reconnect.")}
-if(!resp.ok)throw new Error("Fitbit API error: "+resp.status);
+const resp=await fetch(endpoint,{headers:{Authorization:"Bearer "+token,"Content-Type":"application/json"}});
+if(resp.status===401){localStorage.removeItem("liver_ghealth_token");throw new Error("Session expired. Please reconnect.")}
+if(!resp.ok){const txt=await resp.text();throw new Error("API error "+resp.status+": "+txt.slice(0,200))}
 return resp.json();
 }
 
-async function syncFitbitData(p){
-const results={};
+async function syncHealthData(p){
+const results={};const r=isoRange(7);
+const timeParams="?aggregation.startTime="+r.start+"&aggregation.endTime="+r.end;
+const listParams="?startTime="+r.start+"&endTime="+r.end;
+
 try{
-const [steps,heart,sleep,spo2,profile]=await Promise.allSettled([
-fitbitFetch("/activities/steps/date/today/7d.json"),
-fitbitFetch("/activities/heart/date/today/7d.json"),
-fitbitFetch("/sleep/date/today.json"),
-fitbitFetch("/spo2/date/today.json"),
-fitbitFetch("/profile.json")
+const fetches=await Promise.allSettled([
+ghFetch(GHEALTH_BASE+"/steps:dailyRollUp"+timeParams),
+ghFetch(GHEALTH_BASE+"/restingHeartRate:dailyRollUp"+timeParams),
+ghFetch(GHEALTH_BASE+"/sleep:list"+listParams),
+ghFetch(GHEALTH_BASE+"/oxygenSaturation:list"+listParams),
+ghFetch(GHEALTH_BASE+"/heartRate:list"+listParams+"&pageSize=50")
 ]);
-if(steps.status==="fulfilled")results.steps=steps.value["activities-steps"]||[];
-if(heart.status==="fulfilled")results.heart=heart.value["activities-heart"]||[];
-if(sleep.status==="fulfilled")results.sleep=sleep.value?.sleep||[];
-if(spo2.status==="fulfilled")results.spo2=spo2.value;
-if(profile.status==="fulfilled")results.profile=profile.value?.user;
+
+// Parse steps
+if(fetches[0].status==="fulfilled"&&fetches[0].value?.dailyRollUps){
+results.steps=fetches[0].value.dailyRollUps.map(d=>({
+date:d.date||d.startTime?.split("T")[0],
+value:d.steps?.totalSteps||d.value||0
+}));
+}
+
+// Parse resting heart rate
+if(fetches[1].status==="fulfilled"&&fetches[1].value?.dailyRollUps){
+results.heart=fetches[1].value.dailyRollUps.map(d=>({
+date:d.date||d.startTime?.split("T")[0],
+value:d.restingHeartRate?.beatsPerMinute||d.value||0
+}));
+}
+
+// Parse sleep
+if(fetches[2].status==="fulfilled"){
+const sleepData=fetches[2].value?.sessions||fetches[2].value?.sleep||[];
+results.sleep=sleepData.map(s=>({
+date:s.startTime?.split("T")[0]||s.date,
+durationMs:s.durationMs||s.duration||0,
+efficiency:s.efficiency||null
+}));
+}
+
+// Parse SpO2
+if(fetches[3].status==="fulfilled"){
+const spo2Data=fetches[3].value?.dataPoints||fetches[3].value?.oxygenSaturation||[];
+results.spo2=spo2Data.length?{avg:spo2Data.reduce((s,d)=>s+(d.oxygenSaturation?.percentage||d.value||0),0)/spo2Data.length}:null;
+}
+
+// Parse intraday heart rate
+if(fetches[4].status==="fulfilled"){
+const hrData=fetches[4].value?.dataPoints||[];
+results.hrIntraday=hrData.slice(-20).map(d=>({
+time:d.sampleTime?.physicalTime||d.time,
+bpm:d.heartRate?.beatsPerMinute||d.beatsPerMinute||0
+}));
+}
+
 results.synced=new Date().toISOString();
+results.errors=fetches.filter(f=>f.status==="rejected").map(f=>f.reason?.message).filter(Boolean);
 p.fitbit=results;
-localStorage.setItem("liver_fitbit_sync",new Date().toLocaleString());
+localStorage.setItem("liver_ghealth_sync",new Date().toLocaleString());
 sv();
 return results;
 }catch(e){throw e}
@@ -1426,7 +1479,7 @@ const p=gp();if(!p)return;
 if(prefs.steps&&hour===19&&min<5&&lastCheck!==today+"_steps"){
 const fb=p.fitbit;
 if(fb?.steps?.length){
-const todaySteps=fb.steps.find(s=>s.dateTime===today);
+const todaySteps=fb.steps.find(s=>s.date===today);
 const stepCount=parseInt(todaySteps?.value||0);
 const goal=prefs.stepGoal||8000;
 if(stepCount<goal){
@@ -1470,124 +1523,125 @@ setTimeout(()=>startNotifScheduler(),3000);
 // ═══ WEARABLES PAGE ═══
 function rWearables(){
 const p=gp();
-const token=getFitbitToken();
-const clientId=getFitbitClientId();
+const token=getGHealthToken();
+const clientId=getGHealthClientId();
 const fb=p.fitbit||{};
 const notifPrefs=getNotifPrefs();
 
 const el=h("div",null,h("div",{className:"sh"},h("div",{className:"stl"},"⌚ Wearables")));
 
-// ── Fitbit Connection Card ──
+// ── Connection Card ──
 const connCard=h("div",{className:"fitbit-card"+(token?" fitbit-connected":"")});
 connCard.appendChild(h("div",{className:"fitbit-header"},
-h("div",{className:"fitbit-logo"},"fitbit"),
+h("div",{className:"fitbit-logo",style:{background:"#4285F4",fontSize:"12px"}},"G"),
 h("div",null,
-h("div",{style:{fontWeight:"800",fontSize:"17px",color:"var(--text)"}},token?"Fitbit Connected":"Connect Your Fitbit"),
-h("div",{style:{fontSize:"13px",color:"var(--muted)"}},token?"Charge 6 synced":"Link your Fitbit account to sync health data")
+h("div",{style:{fontWeight:"800",fontSize:"17px",color:"var(--text)"}},token?"Google Health Connected":"Connect Your Fitbit / Wearable"),
+h("div",{style:{fontSize:"13px",color:"var(--muted)"}},token?"Syncing via Google Health API":"Uses Google Health API to sync Fitbit, Pixel Watch, and other devices")
 )
 ));
 
 if(!token){
-// Setup form
 const setup=h("div",{style:{background:"var(--card2)",borderRadius:"14px",padding:"16px",marginBottom:"12px",border:"1px solid var(--border)"}});
-setup.appendChild(h("div",{className:"sl"},"Setup Instructions"));
-setup.appendChild(h("div",{style:{fontSize:"13px",color:"var(--text2)",lineHeight:"1.7",marginBottom:"14px"}},
-"1. Go to ",h("strong",null,"dev.fitbit.com"),", register a new app",h("br",null),
-"2. Set OAuth type to ",h("strong",null,"Client (Personal)"),h("br",null),
-"3. Set Redirect URL to: ",h("strong",{style:{fontSize:"11px",wordBreak:"break-all",color:"var(--accent)"}},window.location.href.split("#")[0].split("?")[0]),h("br",null),
-"4. Copy the ",h("strong",null,"Client ID")," and paste below"
+setup.appendChild(h("div",{className:"sl"},"Setup (one-time, 5 minutes)"));
+setup.appendChild(h("div",{style:{fontSize:"13px",color:"var(--text2)",lineHeight:"1.8",marginBottom:"14px"}},
+"1. Go to ",h("strong",null,"console.cloud.google.com"),h("br",null),
+"2. Create a project, enable ",h("strong",null,"Google Health API"),h("br",null),
+"3. Set up OAuth consent screen (External, add your email as test user)",h("br",null),
+"4. Create OAuth credentials (Web app type)",h("br",null),
+"5. Add ",h("strong",{style:{fontSize:"11px",color:"var(--accent)",wordBreak:"break-all"}},window.location.href.split("#")[0].split("?")[0])," as redirect URI",h("br",null),
+"6. Copy the ",h("strong",null,"Client ID")," and paste below"
 ));
 let cid=clientId;
-setup.appendChild(fl("Fitbit Client ID","text",cid,v=>{cid=v},{ph:"e.g. 23RXYZ"}));
-setup.appendChild(h("button",{className:"bt connect-fitbit bf",onClick:()=>{
-if(!cid.trim()){alert("Please enter your Fitbit Client ID");return}
-localStorage.setItem("liver_fitbit_client_id",cid.trim());
-connectFitbit();
-}},"🔗 Connect Fitbit Account"));
+setup.appendChild(fl("Google OAuth Client ID","text",cid,v=>{cid=v},{ph:"123456789-abc.apps.googleusercontent.com"}));
+setup.appendChild(h("button",{className:"bt connect-fitbit bf",style:{background:"#4285F4"},onClick:()=>{
+if(!cid.trim()){alert("Please enter your Google Cloud Client ID");return}
+localStorage.setItem("liver_ghealth_cid",cid.trim());
+connectGHealth();
+}},"🔗 Connect Google Health Account"));
 connCard.appendChild(setup);
 }else{
-// Connected - show sync button and disconnect
 connCard.appendChild(h("div",{style:{display:"flex",gap:"8px",flexWrap:"wrap"}},
-h("button",{className:"bt connect-fitbit",onClick:async()=>{
+h("button",{className:"bt connect-fitbit",style:{background:"#4285F4"},onClick:async()=>{
 try{
-connCard.querySelector(".fitbit-sync").textContent="⏳ Syncing...";
-await syncFitbitData(p);
+const syncEl=connCard.querySelector(".fitbit-sync");
+if(syncEl)syncEl.textContent="⏳ Syncing...";
+await syncHealthData(p);
 render();
 }catch(e){alert("Sync failed: "+e.message)}
 }},"🔄 Sync Now"),
 h("button",{className:"bt b2",onClick:()=>{
-localStorage.removeItem("liver_fitbit_token");
+localStorage.removeItem("liver_ghealth_token");
 p.fitbit={};sv();
 }},"Disconnect")
 ));
-connCard.appendChild(h("div",{className:"fitbit-sync"},"Last synced: "+(getFitbitLastSync()||"Never")));
+if(fb.errors&&fb.errors.length){
+connCard.appendChild(h("div",{style:{fontSize:"12px",color:"var(--amber)",marginTop:"8px",padding:"8px 12px",background:"var(--ambg)",borderRadius:"10px"}},"⚠️ Some data could not be fetched. The Google Health API is still evolving. Errors: "+fb.errors.join("; ")));
+}
+connCard.appendChild(h("div",{className:"fitbit-sync"},"Last synced: "+(getGHealthLastSync()||"Never")));
 }
 el.appendChild(connCard);
 
-// ── Fitbit Data Display ──
-if(token&&fb.steps){
-// Stats grid
+// ── Health Data Display ──
+if(token&&(fb.steps||fb.heart||fb.sleep)){
 const todayStr=new Date().toISOString().split("T")[0];
-const todaySteps=fb.steps?.find(s=>s.dateTime===todayStr);
-const todayHeart=fb.heart?.find(h=>h.dateTime===todayStr);
-const restingHR=todayHeart?.value?.restingHeartRate||"--";
+const todaySteps=fb.steps?.find(s=>s.date===todayStr);
+const todayHeart=fb.heart?.find(h=>h.date===todayStr);
 const stepCount=parseInt(todaySteps?.value||0);
-const latestSleep=fb.sleep?.[0];
-const sleepHrs=latestSleep?Math.round((latestSleep.duration||0)/3600000*10)/10:"--";
+const restingHR=todayHeart?.value||"--";
+const latestSleep=fb.sleep?.[fb.sleep.length-1];
+const sleepHrs=latestSleep?Math.round((latestSleep.durationMs||0)/3600000*10)/10:"--";
 
 el.appendChild(h("div",{className:"fitbit-grid"},
-h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-icon"},"🚶"),h("div",{className:"fitbit-stat-val",style:{color:"#00B0B9"}},stepCount.toLocaleString()),h("div",{className:"fitbit-stat-lbl"},"Steps Today")),
+h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-icon"},"🚶"),h("div",{className:"fitbit-stat-val",style:{color:"#4285F4"}},stepCount.toLocaleString()),h("div",{className:"fitbit-stat-lbl"},"Steps Today")),
 h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-icon"},"❤️"),h("div",{className:"fitbit-stat-val",style:{color:"var(--red)"}},String(restingHR)),h("div",{className:"fitbit-stat-lbl"},"Resting HR")),
 h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-icon"},"😴"),h("div",{className:"fitbit-stat-val",style:{color:"var(--accent)"}},String(sleepHrs)),h("div",{className:"fitbit-stat-lbl"},"Sleep (hrs)")),
-h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-icon"},"🫁"),h("div",{className:"fitbit-stat-val",style:{color:"var(--green)"}},fb.spo2?.value?String(Math.round(fb.spo2.value.avg||0))+"%":"--"),h("div",{className:"fitbit-stat-lbl"},"SpO2"))
+h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-icon"},"🫁"),h("div",{className:"fitbit-stat-val",style:{color:"var(--green)"}},fb.spo2?String(Math.round(fb.spo2.avg))+"%":"--"),h("div",{className:"fitbit-stat-lbl"},"SpO2"))
 ));
 
-// Steps chart (7 days)
+// Steps chart
 if(fb.steps?.length>1){
 const stepsCard=h("div",{className:"cd"},
 h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"8px"}},
 h("div",null,h("span",{style:{fontWeight:"700",fontSize:"15px"}},"Daily Steps"),h("span",{style:{fontSize:"12px",color:"var(--muted)",marginLeft:"6px"}},"(7 days)")),
-h("span",{className:"mn-f",style:{fontSize:"22px",fontWeight:"800",color:"#00B0B9"}},stepCount.toLocaleString())
-),h("div",{className:"cbox"})
-);
+h("span",{className:"mn-f",style:{fontSize:"22px",fontWeight:"800",color:"#4285F4"}},stepCount.toLocaleString())
+),h("div",{className:"cbox"}));
 el.appendChild(stepsCard);
-setTimeout(()=>{
-const box=stepsCard.querySelector(".cbox");if(!box)return;
+setTimeout(()=>{const box=stepsCard.querySelector(".cbox");if(!box)return;
 const cv=document.createElement("canvas");cv.style.cssText="display:block";box.appendChild(cv);
-const pts=fb.steps.map(s=>({v:parseInt(s.value),label:new Date(s.dateTime+"T00:00:00").toLocaleDateString("en-US",{weekday:"short",day:"numeric"})}));
-drawNutChart(cv,pts,"#00B0B9","steps");
-},80);
+const pts=fb.steps.map(s=>({v:parseInt(s.value),label:s.date?new Date(s.date+"T00:00:00").toLocaleDateString("en-US",{weekday:"short",day:"numeric"}):s.date}));
+drawNutChart(cv,pts,"#4285F4","steps");},80);
 }
 
-// Heart rate chart (7 days resting)
+// Heart rate chart
 if(fb.heart?.length>1){
 const hrCard=h("div",{className:"cd"},
 h("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"8px"}},
 h("div",null,h("span",{style:{fontWeight:"700",fontSize:"15px"}},"Resting Heart Rate"),h("span",{style:{fontSize:"12px",color:"var(--muted)",marginLeft:"6px"}},"(bpm)")),
 h("span",{className:"mn-f",style:{fontSize:"22px",fontWeight:"800",color:dk?"#F08080":"#C03030"}},String(restingHR))
-),h("div",{className:"cbox"})
-);
+),h("div",{className:"cbox"}));
 el.appendChild(hrCard);
-setTimeout(()=>{
-const box=hrCard.querySelector(".cbox");if(!box)return;
+setTimeout(()=>{const box=hrCard.querySelector(".cbox");if(!box)return;
 const cv=document.createElement("canvas");cv.style.cssText="display:block";box.appendChild(cv);
-const pts=fb.heart.filter(h=>h.value?.restingHeartRate).map(h=>({v:h.value.restingHeartRate,label:new Date(h.dateTime+"T00:00:00").toLocaleDateString("en-US",{weekday:"short",day:"numeric"})}));
-if(pts.length)drawNutChart(cv,pts,dk?"#F08080":"#C03030","bpm");
-},80);
+const pts=fb.heart.filter(h=>h.value).map(h=>({v:h.value,label:h.date?new Date(h.date+"T00:00:00").toLocaleDateString("en-US",{weekday:"short",day:"numeric"}):h.date}));
+if(pts.length)drawNutChart(cv,pts,dk?"#F08080":"#C03030","bpm");},80);
 }
 
-// Sleep info
+// Sleep
 if(latestSleep){
-const sleepCard=h("div",{className:"cd"},
+el.appendChild(h("div",{className:"cd"},
 h("div",{style:{fontWeight:"700",fontSize:"15px",marginBottom:"10px"}},"😴 Last Night's Sleep"),
-h("div",{className:"fitbit-grid",style:{gridTemplateColumns:"repeat(3,1fr)"}},
+h("div",{className:"fitbit-grid",style:{gridTemplateColumns:"repeat(2,1fr)"}},
 h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-val",style:{fontSize:"22px",color:"var(--accent)"}},String(sleepHrs)+"h"),h("div",{className:"fitbit-stat-lbl"},"Total Sleep")),
-h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-val",style:{fontSize:"22px",color:"var(--green)"}},latestSleep.efficiency?latestSleep.efficiency+"%":"--"),h("div",{className:"fitbit-stat-lbl"},"Efficiency")),
-h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-val",style:{fontSize:"22px",color:"var(--amber)"}},String(latestSleep.levels?.summary?.wake?.minutes||"--")),h("div",{className:"fitbit-stat-lbl"},"Awake (min)"))
-)
-);
-el.appendChild(sleepCard);
+h("div",{className:"fitbit-stat"},h("div",{className:"fitbit-stat-val",style:{fontSize:"22px",color:"var(--green)"}},latestSleep.efficiency?latestSleep.efficiency+"%":"--"),h("div",{className:"fitbit-stat-lbl"},"Efficiency"))
+)));
 }
+}else if(token){
+el.appendChild(h("div",{style:{textAlign:"center",padding:"24px",background:"var(--card2)",borderRadius:"16px",margin:"16px 0",border:"1px solid var(--border)"}},
+h("div",{style:{fontSize:"32px",marginBottom:"8px"}},"📊"),
+h("div",{style:{fontWeight:"700",fontSize:"15px",color:"var(--text)",marginBottom:"6px"}},"No data yet"),
+h("div",{style:{fontSize:"13px",color:"var(--muted)",marginBottom:"12px"}},"Tap 'Sync Now' above to pull your health data from Google Health API"),
+h("button",{className:"bt bp",onClick:async()=>{try{await syncHealthData(p);render()}catch(e){alert("Sync failed: "+e.message)}}},"🔄 Sync Data")
+));
 }
 
 // ── Notifications Section ──
